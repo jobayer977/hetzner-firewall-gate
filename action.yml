@@ -1,0 +1,31 @@
+name: Hetzner Firewall Gate
+description: Open a Hetzner Cloud firewall for this runner's public IP, then close it again.
+branding:
+  icon: lock
+  color: red
+
+inputs:
+  mode:
+    description: open or close
+    required: true
+  hetzner_token:
+    description: Hetzner Cloud API token with firewall write access
+    required: true
+  firewall_id:
+    description: Numeric id of the Hetzner firewall to gate
+    required: true
+  port:
+    description: TCP port opened for the runner while the gate is open
+    required: false
+    default: '22'
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        HETZNER_TOKEN: ${{ inputs.hetzner_token }}
+        FIREWALL_ID: ${{ inputs.firewall_id }}
+        GATE_PORT: ${{ inputs.port }}
+        GATE_MODE: ${{ inputs.mode }}
+      run: python3 "$GITHUB_ACTION_PATH/firewall-gate.py"
