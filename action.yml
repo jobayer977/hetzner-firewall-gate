@@ -26,6 +26,14 @@ runs:
       env:
         HETZNER_TOKEN: ${{ inputs.hetzner_token }}
         FIREWALL_ID: ${{ inputs.firewall_id }}
+      run: |
+        echo "::add-mask::$HETZNER_TOKEN"
+        echo "::add-mask::$FIREWALL_ID"
+
+    - shell: bash
+      env:
+        HETZNER_TOKEN: ${{ inputs.hetzner_token }}
+        FIREWALL_ID: ${{ inputs.firewall_id }}
         GATE_PORT: ${{ inputs.port }}
         GATE_MODE: ${{ inputs.mode }}
       run: python3 "$GITHUB_ACTION_PATH/firewall-gate.py"

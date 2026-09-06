@@ -6,13 +6,17 @@ Use it when a server is closed to the internet by a Hetzner firewall allowlist a
 
 ## How it works
 
-The action never rewrites your permanent rules. It appends one extra rule tagged `ci-runner-temp`, and on close removes any rule carrying that tag.
+The action never rewrites your permanent rules. It appends one extra rule whose description identifies the run that created it, and removes that rule again on close.
 
 1. `open` reads the firewall's current rules, appends a rule allowing TCP on the chosen port from the runner's IP only, and writes the set back.
 2. Your deploy steps run.
-3. `close` reads the rules again and removes every `ci-runner-temp` rule.
+3. `close` reads the rules again and removes the rule this run created.
 
-Because close strips rules by tag rather than restoring a remembered list, a temporary rule left behind by an interrupted run is swept up by the next run that closes the gate.
+The description looks like `ci-runner-temp:<owner>/<repo>:<run id>:<run attempt>`. Because the tag names the run, a job closing its gate can never strip a rule belonging to a different repository or a different run.
+
+On `open` the action also sweeps rules tagged for the same repository but a different run, so a temporary rule left behind by a cancelled job is cleaned up by the next deploy of that repository rather than lingering.
+
+The runner's address is parsed before use, so a malformed or unexpected response from the address service fails the step rather than producing a rule. IPv4 becomes a `/32` and IPv6 a `/128`.
 
 ## Usage
 
@@ -27,7 +31,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Open firewall
-        uses: jobayer977/hetzner-firewall-gate@v1
+        uses: jobayer977/hetzner-firewall-gate@<commit sha>
         with:
           mode: open
           hetzner_token: ${{ secrets.HETZNER_TOKEN }}
@@ -43,7 +47,7 @@ jobs:
 
       - name: Close firewall
         if: always()
-        uses: jobayer977/hetzner-firewall-gate@v1
+        uses: jobayer977/hetzner-firewall-gate@<commit sha>
         with:
           mode: close
           hetzner_token: ${{ secrets.HETZNER_TOKEN }}
@@ -63,13 +67,17 @@ Find the firewall id in the Hetzner Cloud console URL, or through `GET https://a
 
 ## Notes on safe use
 
-**Always pair `open` with a `close` step that carries `if: always()`.** Without it a cancelled or failed job leaves the gate open until the next successful run.
+**Always pair `open` with a `close` step that carries `if: always()`.** Without it a cancelled or failed job leaves the gate open until the next deploy of that repository sweeps it.
 
 **Pin the action to a commit SHA rather than a tag.** Every caller hands this action a Hetzner API token, so a moving tag means whoever controls the tag controls that token.
 
 **Give the token the smallest scope you can.** Hetzner tokens are project-wide, so create a token used by nothing else and rotate it on a schedule.
 
-**Serialise deploys that share one firewall.** Hetzner's rule API has no compare-and-swap, so two jobs writing at the same moment can lose an update. A `concurrency` group covers one repository; several repositories sharing a firewall need the group in each of them, and even then the action's write-then-verify retry is what catches a genuine collision.
+**Understand what the concurrency group is protecting.** Hetzner's rule API replaces the whole rule set and offers no compare-and-swap, so two jobs that read the rules at the same moment can each write a set that drops the other's rule. Run-scoped tags stop a close from stripping someone else's gate, but they cannot prevent that lost update on open.
+
+The action's defence is limited and worth stating plainly. After writing, it pauses, reads the rules back, and writes again if its own rule is missing, up to five times. That catches a competing write landing within a couple of seconds. It cannot catch one that lands later, while the deploy is already running.
+
+A `concurrency` group is therefore the real protection, and a group only serialises jobs within one repository. Several repositories sharing one firewall need either a shared external lock or the acceptance that a rare collision will fail a deploy, which is the safe direction to fail.
 
 ## Requirements
 
