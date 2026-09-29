@@ -8,13 +8,23 @@ Use it when a server is closed to the internet by a Hetzner firewall allowlist a
 
 The action never rewrites your permanent rules. It appends one extra rule whose description identifies the run that created it, and removes that rule again on close.
 
-1. `open` reads the firewall's current rules, appends a rule allowing TCP on the chosen port from the runner's IP only, and writes the set back.
+1. `open` takes a lock on the firewall, reads the current rules, appends a rule allowing TCP on the chosen port from the runner's IP only, writes the set back, and releases the lock.
 2. Your deploy steps run.
-3. `close` reads the rules again and removes the rule this run created.
+3. `close` takes the same lock and removes the rule this run created.
 
-The description looks like `ci-runner-temp:<owner>/<repo>:<run id>:<run attempt>`. Because the tag names the run, a job closing its gate can never strip a rule belonging to a different repository or a different run.
+The description looks like `ci-runner-temp:<owner>/<repo>:<run id>:<run attempt>:exp=<unix time>`. Because the tag names the run, a job closing its gate can never strip a rule belonging to a different repository or a different run.
 
-On `open` the action also sweeps rules tagged for the same repository but a different run, so a temporary rule left behind by a cancelled job is cleaned up by the next deploy of that repository rather than lingering.
+### The lock
+
+Hetzner's rule API replaces the whole rule set and offers no compare-and-swap, so two jobs that read the rules at the same moment can each write a set that drops the other's rule. GitHub's `concurrency` groups are scoped to one repository, so they cannot serialise repositories that share a firewall.
+
+The action therefore serialises on the firewall itself. Every read-modify-write happens while holding a lease, recorded as a rule tagged `ci-runner-temp:lock:<owner>/<repo>:<run id>:<run attempt>:exp=<unix time>` and pointing at `192.0.2.1/32`, an address from the documentation range that routes nowhere. A caller claims the lease only when it sees no live foreign lease, then reads the rules back to confirm the lease is its own before mutating anything. A caller that loses the claim backs off with jitter and tries again. The lease carries a fifteen minute expiry, so a killed runner cannot wedge the firewall.
+
+### Expiry and reclamation
+
+Every rule the action writes carries an expiry in its description: one hour for a gate rule, fifteen minutes for a lease. Any caller holding the lease reclaims expired rules, whichever repository wrote them. A rule left behind by a cancelled job or a killed runner is therefore cleared by the next deploy of any repository sharing the firewall, not only by the repository that leaked it.
+
+Rules written by older versions of this action carry no expiry. They are left alone, and swept as before by the repository that owns them.
 
 The runner's address is parsed before use, so a malformed or unexpected response from the address service fails the step rather than producing a rule. IPv4 becomes a `/32` and IPv6 a `/128`.
 
@@ -73,11 +83,7 @@ Find the firewall id in the Hetzner Cloud console URL, or through `GET https://a
 
 **Give the token the smallest scope you can.** Hetzner tokens are project-wide, so create a token used by nothing else and rotate it on a schedule.
 
-**Understand what the concurrency group is protecting.** Hetzner's rule API replaces the whole rule set and offers no compare-and-swap, so two jobs that read the rules at the same moment can each write a set that drops the other's rule. Run-scoped tags stop a close from stripping someone else's gate, but they cannot prevent that lost update on open.
-
-The action's defence is limited and worth stating plainly. After writing, it pauses, reads the rules back, and writes again if its own rule is missing, up to five times. That catches a competing write landing within a couple of seconds. It cannot catch one that lands later, while the deploy is already running.
-
-A `concurrency` group is therefore the real protection, and a group only serialises jobs within one repository. Several repositories sharing one firewall need either a shared external lock or the acceptance that a rare collision will fail a deploy, which is the safe direction to fail.
+**A `concurrency` group is still worth setting.** The lease makes concurrent deploys correct; a `concurrency` group makes them cheap, by keeping jobs in one repository from queueing on the lease at all.
 
 ## Requirements
 
