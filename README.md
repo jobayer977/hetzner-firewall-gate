@@ -18,11 +18,13 @@ The description looks like `ci-runner-temp:<owner>/<repo>:<run id>:<run attempt>
 
 Hetzner's rule API replaces the whole rule set and offers no compare-and-swap, so two jobs that read the rules at the same moment can each write a set that drops the other's rule. GitHub's `concurrency` groups are scoped to one repository, so they cannot serialise repositories that share a firewall.
 
-The action therefore serialises on the firewall itself. Every read-modify-write happens while holding a lease, recorded as a rule tagged `ci-runner-temp:lock:<owner>/<repo>:<run id>:<run attempt>:exp=<unix time>` and pointing at `192.0.2.1/32`, an address from the documentation range that routes nowhere. A caller claims the lease only when it sees no live foreign lease, then reads the rules back to confirm the lease is its own before mutating anything. A caller that loses the claim backs off with jitter and tries again. The lease carries a fifteen minute expiry, so a killed runner cannot wedge the firewall.
+The action therefore serialises on the firewall itself, and the lease lives outside the rule set it protects. Holding the lease is recorded in the firewall's `ci-gate-lock` label as `<owner>_<repo>_<run id>_<run attempt>.exp-<unix time>`; the label endpoint is a separate write that `set_rules` never touches, so claiming or losing a lease can never drop a rule. A caller claims the lease only when it sees no live foreign lease, then reads the label back to confirm the lease is its own before mutating any rule. A caller that loses the claim backs off with jitter and tries again. Every rule write re-confirms the lease first, so a lease stolen after expiry cannot leave two callers writing at once. The lease carries a fifteen minute expiry, so a killed runner cannot wedge the firewall.
+
+A lease recorded as a rule cannot do this: the claim itself is a whole-rule-set write built from a read taken before the claim, so two callers racing to claim can each erase the other's gate rule while both report success.
 
 ### Expiry and reclamation
 
-Every rule the action writes carries an expiry in its description: one hour for a gate rule, fifteen minutes for a lease. Any caller holding the lease reclaims expired rules, whichever repository wrote them. A rule left behind by a cancelled job or a killed runner is therefore cleared by the next deploy of any repository sharing the firewall, not only by the repository that leaked it.
+Every rule the action writes carries an expiry in its description, one hour for a gate rule, and the lease label carries fifteen minutes. Any caller holding the lease reclaims expired rules, whichever repository wrote them, including lease rules left behind by earlier versions of this action. A rule left behind by a cancelled job or a killed runner is therefore cleared by the next deploy of any repository sharing the firewall, not only by the repository that leaked it.
 
 Rules written by older versions of this action carry no expiry. They are left alone, and swept as before by the repository that owns them.
 
@@ -80,6 +82,8 @@ Find the firewall id in the Hetzner Cloud console URL, or through `GET https://a
 **Always pair `open` with a `close` step that carries `if: always()`.** Without it a cancelled or failed job leaves the gate open until the next deploy of that repository sweeps it.
 
 **Pin the action to a commit SHA rather than a tag.** Every caller hands this action a Hetzner API token, so a moving tag means whoever controls the tag controls that token.
+
+**Pin every repository that shares a firewall to the same version of this action.** The lease is cooperative: a caller running a version that does not take it will still replace the whole rule set from a stale read and erase a lease holder's gate rule. One repository left on an older pin reopens the race for every other repository on that firewall.
 
 **Give the token the smallest scope you can.** Hetzner tokens are project-wide, so create a token used by nothing else and rotate it on a schedule.
 

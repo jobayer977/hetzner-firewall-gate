@@ -1,14 +1,19 @@
+import hashlib
 import ipaddress
 import json
 import os
 import random
+import re
 import time
 import urllib.request
 
 TAG_PREFIX = "ci-runner-temp"
-LOCK_PREFIX = f"{TAG_PREFIX}:lock"
 EXPIRY_MARKER = "exp="
-LOCK_PLACEHOLDER_IP = "192.0.2.1/32"
+LOCK_LABEL = "ci-gate-lock"
+LOCK_SEPARATOR = ".exp-"
+OWNER_LIMIT = 46
+DIGEST_LENGTH = 8
+LABEL_ALLOWED = re.compile(r"[^A-Za-z0-9_.-]")
 
 API_ROOT = os.environ.get("HETZNER_API_ROOT", "https://api.hetzner.cloud/v1/firewalls")
 PUBLIC_IP_SERVICE = os.environ.get("RUNNER_IP_SERVICE", "https://api.ipify.org")
@@ -28,7 +33,6 @@ RUN_ATTEMPT = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
 
 REPOSITORY_TAG = f"{TAG_PREFIX}:{REPOSITORY}"
 RUN_TAG = f"{REPOSITORY_TAG}:{RUN_ID}:{RUN_ATTEMPT}"
-LOCK_TAG = f"{LOCK_PREFIX}:{REPOSITORY}:{RUN_ID}:{RUN_ATTEMPT}"
 
 
 def read_json(url, method="GET", body=None):
@@ -40,17 +44,40 @@ def read_json(url, method="GET", body=None):
         return json.load(response)
 
 
+def read_firewall():
+    return read_json(f"{API_ROOT}/{FIREWALL_ID}")["firewall"]
+
+
 def read_rules():
-    return read_json(f"{API_ROOT}/{FIREWALL_ID}")["firewall"]["rules"]
+    return read_firewall()["rules"]
+
+
+def read_labels():
+    return read_firewall().get("labels") or {}
 
 
 def write_rules(rules):
     read_json(f"{API_ROOT}/{FIREWALL_ID}/actions/set_rules", "POST", {"rules": rules})
 
 
+def write_labels(labels):
+    read_json(f"{API_ROOT}/{FIREWALL_ID}", "PUT", {"labels": labels})
+
+
 def read_runner_ip():
     with urllib.request.urlopen(PUBLIC_IP_SERVICE, timeout=30) as response:
         return ipaddress.ip_address(response.read().decode().strip())
+
+
+def label_safe(value):
+    cleaned = LABEL_ALLOWED.sub("_", value)
+    if len(cleaned) <= OWNER_LIMIT:
+        return cleaned
+    digest = hashlib.sha1(cleaned.encode()).hexdigest()[:DIGEST_LENGTH]
+    return f"{cleaned[:OWNER_LIMIT - DIGEST_LENGTH - 1]}-{digest}"
+
+
+LOCK_OWNER = label_safe(f"{REPOSITORY}:{RUN_ID}:{RUN_ATTEMPT}")
 
 
 def stamped(tag, ttl_seconds):
@@ -71,14 +98,6 @@ def is_expired(rule):
     return expiry is not None and expiry <= time.time()
 
 
-def is_lock_rule(rule):
-    return description_of(rule).startswith(f"{LOCK_PREFIX}:")
-
-
-def is_own_lock(rule):
-    return description_of(rule).startswith(f"{LOCK_TAG}:")
-
-
 def is_own_gate(rule):
     return description_of(rule).startswith(f"{RUN_TAG}:")
 
@@ -88,7 +107,7 @@ def is_own_repository_rule(rule):
 
 
 def is_reclaimable(rule):
-    if is_own_lock(rule) or is_own_gate(rule):
+    if is_own_gate(rule):
         return False
     if is_own_repository_rule(rule):
         return True
@@ -105,42 +124,56 @@ def temp_rule(runner_ip):
     }
 
 
-def lock_rule():
-    return {
-        "direction": "in",
-        "protocol": "tcp",
-        "port": GATE_PORT,
-        "source_ips": [LOCK_PLACEHOLDER_IP],
-        "description": stamped(LOCK_TAG, LOCK_TTL_SECONDS),
-    }
-
-
 def kept_rules(rules):
     return [rule for rule in rules if not is_reclaimable(rule) and not is_own_gate(rule)]
 
 
-def rules_without_locks(rules):
-    return [rule for rule in rules if not is_lock_rule(rule)]
+def lock_parts(labels):
+    holder, separator, raw = (labels.get(LOCK_LABEL) or "").rpartition(LOCK_SEPARATOR)
+    if not separator or not raw.isdigit():
+        return "", 0
+    return holder, int(raw)
 
 
-def live_foreign_lock(rules):
-    for rule in rules:
-        if is_lock_rule(rule) and not is_own_lock(rule) and not is_expired(rule):
-            return rule
-    return None
+def lock_is_ours(labels):
+    return lock_parts(labels)[0] == LOCK_OWNER
 
 
-def holds_lock(rules):
-    locks = [rule for rule in rules if is_lock_rule(rule) and not is_expired(rule)]
-    return len(locks) == 1 and is_own_lock(locks[0])
+def lock_is_takeable(labels):
+    holder, deadline = lock_parts(labels)
+    return not holder or holder == LOCK_OWNER or deadline <= time.time()
 
 
 def backoff():
     time.sleep(RETRY_DELAY_SECONDS * (0.5 + random.random()))
 
 
+def lock_value():
+    return f"{LOCK_OWNER}{LOCK_SEPARATOR}{int(time.time() + LOCK_TTL_SECONDS)}"
+
+
+def claim_lock():
+    for attempt in range(1, LOCK_ATTEMPTS + 1):
+        labels = read_labels()
+        if lock_is_takeable(labels):
+            write_labels({**labels, LOCK_LABEL: lock_value()})
+            time.sleep(SETTLE_DELAY_SECONDS)
+            if lock_is_ours(read_labels()):
+                return attempt
+        backoff()
+    raise SystemExit(f"firewall {FIREWALL_ID} gate lock not acquired after {LOCK_ATTEMPTS} attempts")
+
+
+def release_lock():
+    labels = read_labels()
+    if not lock_is_ours(labels):
+        return
+    write_labels({key: value for key, value in labels.items() if key != LOCK_LABEL})
+
+
 def settle(build_wanted_rules, is_settled):
     for attempt in range(1, WRITE_ATTEMPTS + 1):
+        claim_lock()
         write_rules(build_wanted_rules(read_rules()))
         time.sleep(SETTLE_DELAY_SECONDS)
         if is_settled(read_rules()):
@@ -149,25 +182,7 @@ def settle(build_wanted_rules, is_settled):
     raise SystemExit(f"firewall {FIREWALL_ID} did not settle after {WRITE_ATTEMPTS} attempts")
 
 
-def claim_lock():
-    for attempt in range(1, LOCK_ATTEMPTS + 1):
-        rules = read_rules()
-        if live_foreign_lock(rules) is None:
-            write_rules(rules_without_locks(rules) + [lock_rule()])
-            time.sleep(SETTLE_DELAY_SECONDS)
-            if holds_lock(read_rules()):
-                return attempt
-        backoff()
-    raise SystemExit(f"firewall {FIREWALL_ID} lock not acquired after {LOCK_ATTEMPTS} attempts")
-
-
-def release_lock():
-    settle(lambda rules: [rule for rule in rules if not is_own_lock(rule)],
-           lambda rules: not any(is_own_lock(rule) for rule in rules))
-
-
 def apply_under_lock(build_wanted_rules, is_settled):
-    claim_lock()
     try:
         return settle(build_wanted_rules, is_settled)
     finally:
