@@ -7,8 +7,9 @@ RUNNER_IP = b"203.0.113.9"
 
 
 class Firewall:
-    def __init__(self, rules):
+    def __init__(self, rules, labels=None):
         self.rules = list(rules)
+        self.labels = dict(labels or {})
         self.lock = threading.Lock()
         self.calls = []
         self.hold_needle = None
@@ -18,9 +19,17 @@ class Firewall:
         with self.lock:
             return list(self.rules)
 
+    def label_snapshot(self):
+        with self.lock:
+            return dict(self.labels)
+
     def replace(self, rules):
         with self.lock:
             self.rules = list(rules)
+
+    def replace_labels(self, labels):
+        with self.lock:
+            self.labels = dict(labels)
 
     def descriptions(self):
         return [rule.get("description") or "" for rule in self.snapshot()]
@@ -43,17 +52,27 @@ def build_handler(firewall):
             self.end_headers()
             self.wfile.write(body)
 
+        def _read_body(self):
+            length = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(length)) if length else {}
+
         def do_GET(self):
             if self.path == "/ip":
                 self._send(RUNNER_IP, raw=True)
                 return
             rules = firewall.snapshot()
+            labels = firewall.label_snapshot()
             firewall.calls.append(("GET", [r.get("description") for r in rules]))
-            self._send({"firewall": {"rules": rules}})
+            self._send({"firewall": {"rules": rules, "labels": labels}})
+
+        def do_PUT(self):
+            body = self._read_body()
+            firewall.replace_labels(body.get("labels") or {})
+            firewall.calls.append(("PUT", body.get("labels")))
+            self._send({"firewall": {"rules": firewall.snapshot(), "labels": firewall.label_snapshot()}})
 
         def do_POST(self):
-            length = int(self.headers.get("Content-Length", 0))
-            rules = json.loads(self.rfile.read(length))["rules"]
+            rules = self._read_body()["rules"]
             if firewall.should_hold(rules):
                 firewall.hold_needle = None
                 time.sleep(firewall.hold_seconds)
